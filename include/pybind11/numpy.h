@@ -11,6 +11,7 @@
 
 #include "pybind11.h"
 #include "complex.h"
+#include "iostream.h"
 #include <numeric>
 #include <algorithm>
 #include <array>
@@ -153,6 +154,8 @@ struct npy_api {
          Py_intptr_t *, void *, int, PyObject *);
     PyObject *(*PyArray_DescrNewFromType_)(int);
     int (*PyArray_CopyInto_)(PyObject *, PyObject *);
+    PyObject* (*PyArray_DescrNew_)(PyObject *);
+//    int (*PyArray_MoveInto_)(PyObject *, PyObject *);
     PyObject *(*PyArray_NewCopy_)(PyObject *, int);
     PyTypeObject *PyArray_Type_;
     PyTypeObject *PyVoidArrType_Type_;
@@ -180,6 +183,7 @@ private:
         API_PyArray_NewCopy = 85,
         API_PyArray_NewFromDescr = 94,
         API_PyArray_DescrNewFromType = 9,
+        API_PyArray_DescrNew = 95,
         API_PyArray_DescrConverter = 174,
         API_PyArray_EquivTypes = 182,
         API_PyArray_GetArrayParamsFromObject = 278,
@@ -208,6 +212,7 @@ private:
         DECL_NPY_API(PyArray_FromAny);
         DECL_NPY_API(PyArray_Resize);
         DECL_NPY_API(PyArray_CopyInto);
+        DECL_NPY_API(PyArray_DescrNew);
         DECL_NPY_API(PyArray_NewCopy);
         DECL_NPY_API(PyArray_NewFromDescr);
         DECL_NPY_API(PyArray_DescrNewFromType);
@@ -551,6 +556,8 @@ public:
             throw error_already_set();
         if (ptr) {
             if (base) {
+                // Because this function steals the reference, so if we don't
+                // increase the function will destroy the object, basically.
                 api.PyArray_SetBaseObject_(tmp.ptr(), base.inc_ref().ptr());
             } else {
                 tmp = reinterpret_steal<object>(api.PyArray_NewCopy_(tmp.ptr(), -1 /* any order */));
@@ -560,7 +567,11 @@ public:
     }
 
     array(const pybind11::dtype &dt, ShapeContainer shape, const void *ptr = nullptr, handle base = handle())
-        : array(dt, std::move(shape), {}, ptr, base) { }
+        : array(dt, std::move(shape), {}, ptr, base) {
+#if PRINT_STUFF == 1
+        std::cout << "CONSTRUCTOR CALLED " << std::endl;
+#endif
+    }
 
     template <typename T, typename = detail::enable_if_t<std::is_integral<T>::value && !std::is_same<bool, T>::value>>
     array(const pybind11::dtype &dt, T count, const void *ptr = nullptr, handle base = handle())
@@ -736,6 +747,15 @@ public:
         return result;
     }
 
+  // Default, C-style strides
+  static std::vector<ssize_t> c_strides(const std::vector<ssize_t> &shape, ssize_t itemsize) {
+      auto ndim = shape.size();
+      std::vector<ssize_t> strides(ndim, itemsize);
+      for (size_t i = ndim - 1; i > 0; --i)
+          strides[i - 1] = strides[i] * shape[i];
+      return strides;
+  }
+
 protected:
     template<typename, typename> friend struct detail::npy_format_descriptor;
 
@@ -754,14 +774,6 @@ protected:
             throw std::domain_error("array is not writeable");
     }
 
-    // Default, C-style strides
-    static std::vector<ssize_t> c_strides(const std::vector<ssize_t> &shape, ssize_t itemsize) {
-        auto ndim = shape.size();
-        std::vector<ssize_t> strides(ndim, itemsize);
-        for (size_t i = ndim - 1; i > 0; --i)
-            strides[i - 1] = strides[i] * shape[i];
-        return strides;
-    }
 
     // F-style strides; default when constructing an array_t with `ExtraFlags & f_style`
     static std::vector<ssize_t> f_strides(const std::vector<ssize_t> &shape, ssize_t itemsize) {
@@ -1055,7 +1067,21 @@ struct field_descriptor {
     std::string format;
     dtype descr;
 };
-
+/*
+static bool direct_converter(PyObject *obj, void*& value) {
+ //Get the api
+    auto& api = npy_api::get();
+    if (!PyObject_TypeCheck(obj, api.PyVoidArrType_Type_))
+        return false;
+    if (auto descr = reinterpret_steal<object>(api.PyArray_DescrFromScalar_(obj))) {
+        if (api.PyArray_EquivTypes_(dtype_ptr(), descr.ptr())) {
+            value = ((PyVoidScalarObject_Proxy *) obj)->obval;
+            return true;
+        }
+    }
+return false;
+}
+ */
 inline PYBIND11_NOINLINE void register_structured_dtype(
     const std::initializer_list<field_descriptor>& fields,
     const std::type_info& tinfo, ssize_t itemsize,
@@ -1202,6 +1228,23 @@ private:
 #define PYBIND11_MAP_LIST(f, t, ...) \
     PYBIND11_EVAL (PYBIND11_MAP_LIST1 (f, t, __VA_ARGS__, (), 0))
 
+// Extract name, offset and format descriptor for a struct field
+// #define PYBIND11_FIELD_DESCRIPTOR(T, Field) PYBIND11_FIELD_DESCRIPTOR_EX(T, Field, #Field)
+// #define PYBIND11_FIELD_DESCRIPTOR_EX(T, Field, Name)                                          \
+//    ::pybind11::detail::field_descriptor {                                                    \
+//        Name, offsetof(T, Field), sizeof(decltype(std::declval<T>().Field)),                  \
+//        ::pybind11::format_descriptor<decltype(std::declval<T>().Field)>::format(),           \
+//        ::pybind11::detail::npy_format_descriptor<decltype(std::declval<T>().Field)>::dtype() \
+//    }
+//struct field_descriptor {
+//    const char *name;
+//    ssize_t offset;
+//    ssize_t size;
+//    std::string format;
+//    dtype descr;
+//};
+// This function is for registering structures.  It calls:
+// PYBIND11_FIELD_DESCRIPTOR(Type, field1, field2,...)
 #define PYBIND11_NUMPY_DTYPE(Type, ...) \
     ::pybind11::detail::npy_format_descriptor<Type>::register_dtype \
         ({PYBIND11_MAP_LIST (PYBIND11_FIELD_DESCRIPTOR, Type, __VA_ARGS__)})
@@ -1226,6 +1269,26 @@ private:
 #define PYBIND11_NUMPY_DTYPE_EX(Type, ...) \
     ::pybind11::detail::npy_format_descriptor<Type>::register_dtype \
         ({PYBIND11_MAP2_LIST (PYBIND11_FIELD_DESCRIPTOR_EX, Type, __VA_ARGS__)})
+
+//#ifdef USE_AD
+// This function basically creates a templated static function,
+// pybind11::detail::npy_format_descriptor which return a pointer of type
+// pybind11::dtype and the name is "object"
+#define PYBIND11_NUMPY_OBJECT_DTYPE(Type) \
+    namespace pybind11 { namespace detail { \
+        template <> struct npy_format_descriptor<Type> { \
+        public: \
+            enum { value = npy_api::NPY_OBJECT_ }; \
+            static pybind11::dtype dtype() { \
+                if (auto ptr = npy_api::get().PyArray_DescrFromType_(value)) { \
+                    return reinterpret_borrow<pybind11::dtype>(ptr); \
+                } \
+                pybind11_fail("Unsupported buffer format!"); \
+            } \
+            static constexpr auto name = _("object"); \
+        }; \
+    }}
+//#endif
 
 #endif // __CLION_IDE__
 

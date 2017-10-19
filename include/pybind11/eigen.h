@@ -10,6 +10,8 @@
 #pragma once
 
 #include "numpy.h"
+#include <iostream>
+#include <numpy/ndarraytypes.h>
 
 #if defined(__INTEL_COMPILER)
 #  pragma warning(disable: 1682) // implicit conversion of a 64-bit integral type to a smaller integral type (potential portability problem)
@@ -91,6 +93,16 @@ template <bool EigenRowMajor> struct EigenConformable {
     template <typename props> bool stride_compatible() const {
         // To have compatible strides, we need (on both dimensions) one of fully dynamic strides,
         // matching strides, or a dimension size of 1 (in which case the stride value is irrelevant)
+
+        std::cout <<"-tive stride: "  << (bool) negativestrides << std::endl;
+        std::cout << "inner_stride dynamic? " << (props::inner_stride == Eigen::Dynamic) << std::endl;
+        std::cout << "outer_stide dynamic? " << (props::outer_stride == Eigen::Dynamic) << std::endl;
+        std::cout << "stride.inner() " << stride.inner() << std::endl;
+        std::cout << "stride.outer() " << stride.outer() << std::endl;
+        std::cout << "RowMajor " << ((EigenRowMajor ? cols : rows) == 1) <<std::endl;
+        std::cout << "RowMajor " << ((EigenRowMajor ? rows : cols) == 1) <<std::endl;
+        std::cout << "props inner_stride " << props::inner_stride << " props outer Stride " << props::outer_stride << std::endl;
+        std::cout << "Inner stride " << stride.inner() << " Outer Stride " << stride.outer() << std::endl;
         return
             !negativestrides &&
             (props::inner_stride == Eigen::Dynamic || props::inner_stride == stride.inner() ||
@@ -139,24 +151,34 @@ template <typename Type_> struct EigenProps {
         const auto dims = a.ndim();
         if (dims < 1 || dims > 2)
             return false;
+        bool is_pyobject = false;
+        if (npy_format_descriptor<Scalar>::value == npy_api::NPY_OBJECT_)
+            is_pyobject = true;
 
         if (dims == 2) { // Matrix type: require exact match (or dynamic)
 
             EigenIndex
                 np_rows = a.shape(0),
-                np_cols = a.shape(1),
-                np_rstride = a.strides(0) / static_cast<ssize_t>(sizeof(Scalar)),
-                np_cstride = a.strides(1) / static_cast<ssize_t>(sizeof(Scalar));
+                np_cols = a.shape(1), np_rstride, np_cstride;
+
+                np_rstride =
+                    a.strides(0) / (is_pyobject ? sizeof(PyObject*) : static_cast<ssize_t>(sizeof(Scalar))),
+                np_cstride =
+                    a.strides(1) / (is_pyobject ? sizeof(PyObject*) : static_cast<ssize_t>(sizeof(Scalar)));
+
             if ((fixed_rows && np_rows != rows) || (fixed_cols && np_cols != cols))
                 return false;
 
+            std::cout << "a.strides(0) in conformable " << a.strides(0) << std::endl;
+            std::cout << "Scalar Size " <<  static_cast<ssize_t>(sizeof(Scalar)) << std::endl;
+            std::cout << "Returned array from conformable = " << np_rows << " " << np_cols << " " << np_rstride << " " << np_cstride << std::endl;
             return {np_rows, np_cols, np_rstride, np_cstride};
         }
 
         // Otherwise we're storing an n-vector.  Only one of the strides will be used, but whichever
         // is used, we want the (single) numpy stride value.
         const EigenIndex n = a.shape(0),
-              stride = a.strides(0) / static_cast<ssize_t>(sizeof(Scalar));
+              stride = a.strides(0) / (is_pyobject ? sizeof(PyObject*) : static_cast<ssize_t>(sizeof(Scalar)));
 
         if (vector) { // Eigen type is a compile-time vector
             if (fixed && size != n)
@@ -206,12 +228,61 @@ template <typename Type_> struct EigenProps {
 // otherwise it'll make a copy.  writeable lets you turn off the writeable flag for the array.
 template <typename props> handle eigen_array_cast(typename props::Type const &src, handle base = handle(), bool writeable = true) {
     constexpr ssize_t elem_size = sizeof(typename props::Scalar);
+    std::cout << "eigen_array_cast called \n";
     array a;
-    if (props::vector)
-        a = array({ src.size() }, { elem_size * src.innerStride() }, src.data(), base);
-    else
-        a = array({ src.rows(), src.cols() }, { elem_size * src.rowStride(), elem_size * src.colStride() },
-                  src.data(), base);
+    using Scalar = typename props::Type::Scalar;
+    if (props::vector) {
+        if (npy_format_descriptor<Scalar>::value == npy_api::NPY_OBJECT_) {
+            a = array(
+                npy_format_descriptor<Scalar>::dtype(),  // type
+                { (size_t) src.size() }, // shape
+                nullptr,
+                base
+            );
+            auto policy = base ? return_value_policy::automatic_reference : return_value_policy::copy;
+            for (size_t i = 0; i < src.size(); ++i) {
+                auto value_ = reinterpret_steal<object>(make_caster<Scalar>::cast(src(i, 0), policy, base));
+                if (!value_)
+                    return handle();
+                auto p = a.mutable_data(i);
+                PyArray_SETITEM(a.ptr(), p, value_.release().ptr()); // steals a reference
+            }
+        }
+        else
+            a = array({src.size()},
+                      {elem_size * src.innerStride()},
+                      src.data(),
+                      base);
+
+    }
+    else {
+        if (npy_format_descriptor<Scalar>::value == npy_api::NPY_OBJECT_) {
+            a = array(
+                npy_format_descriptor<Scalar>::dtype(),  // type
+                {(size_t) src.rows(), (size_t) src.cols()},
+                nullptr,
+                base
+            );
+            auto policy = base ? return_value_policy::automatic_reference : return_value_policy::copy;
+            std::cout << "--------------- copy policy: " << (int) return_value_policy::copy << std::endl;
+            std::cout << "---------------- policy: " << (int) policy << std::endl;
+            for (size_t i = 0; i < src.rows(); ++i) {
+                for (size_t j = 0; j < src.cols(); ++j) {
+                    auto value_ = reinterpret_steal<object>(make_caster<Scalar>::cast(src(i, j), policy, base));
+                    if (!value_)
+                        return handle();
+                    auto p = a.mutable_data(i, j);
+                    PyArray_SETITEM(a.ptr(), p, value_.release().ptr()); // steals a reference
+                }
+            }
+            std::cout << "strides at eigen_cast " << a.strides(0) << std::endl;
+        }
+        else
+        a = array({src.rows(), src.cols()},
+                  {elem_size * src.rowStride(), elem_size * src.colStride()},
+                  src.data(),
+                  base);
+    }
 
     if (!writeable)
         array_proxy(a.ptr())->flags &= ~detail::npy_api::NPY_ARRAY_WRITEABLE_;
@@ -236,6 +307,7 @@ handle eigen_ref_array(Type &src, handle parent = none()) {
 // not the Type of the pointer given is const.
 template <typename props, typename Type, typename = enable_if_t<is_eigen_dense_plain<Type>::value>>
 handle eigen_encapsulate(Type *src) {
+    std::cout << "EIGEN ENCAPSULATE CALLED" << std::endl;
     capsule base(src, [](void *o) { delete static_cast<Type *>(o); });
     return eigen_ref_array<props>(*src, base);
 }
@@ -248,6 +320,7 @@ struct type_caster<Type, enable_if_t<is_eigen_dense_plain<Type>::value>> {
     using props = EigenProps<Type>;
 
     bool load(handle src, bool convert) {
+        std::cout << "IN LOAD" << std::endl;
         // If we're in no-convert mode, only load if given an array of the correct type
         if (!convert && !isinstance<array_t<Scalar>>(src))
             return false;
@@ -265,13 +338,52 @@ struct type_caster<Type, enable_if_t<is_eigen_dense_plain<Type>::value>> {
         auto fits = props::conformable(buf);
         if (!fits)
             return false;
-
+        int result = 0;
         // Allocate the new type, then build a numpy reference into it
         value = Type(fits.rows, fits.cols);
-        auto ref = reinterpret_steal<array>(eigen_ref_array<props>(value));
-        if (dims == 1) ref = ref.squeeze();
 
-        int result = detail::npy_api::get().PyArray_CopyInto_(ref.ptr(), buf.ptr());
+        std::cout << "FROM LOAD --- STRIDE INNER: " << fits.stride.inner() << "    OUTER:" << fits.stride.outer() << std::endl;
+        std::cout << "FROM LOAD --- ROWS: " << fits.rows << "   COLS:" << fits.cols << std::endl;
+
+        if (npy_format_descriptor<Scalar>::value == npy_api::NPY_OBJECT_) {
+            if (dims == 1){
+                if (Type::RowsAtCompileTime == Eigen::Dynamic || Type::ColsAtCompileTime == Eigen::Dynamic) {
+                    value.resize(buf.shape(0), 1);
+                }
+                for (size_t i = 0; i < buf.shape(0); ++i) {
+                    auto p = buf.mutable_data(i);
+                    make_caster <Scalar> conv_val;
+                    if (!conv_val.load(PyArray_GETITEM(buf.ptr(), p), convert))
+                        return false;
+                    value(i) = cast_op<Scalar>(conv_val);
+                }
+            } else {
+                if (Type::RowsAtCompileTime == Eigen::Dynamic || Type::ColsAtCompileTime == Eigen::Dynamic) {
+                    value.resize(buf.shape(0), buf.shape(1));
+                }
+                std::cout << "INSIDE NPY_OBJECT" << std::endl;
+                for (size_t i = 0; i < buf.shape(0); ++i) {
+                    for (size_t j = 0; j < buf.shape(1); ++j) {
+                        std::cout << "RIGHT THING CALLED " << buf.shape(0) << " " << buf.shape(1) << std::endl;
+                        // p is the const void pointer to the item
+                        auto p = buf.mutable_data(i, j);
+                        make_caster<Scalar> conv_val;
+                        if (!conv_val.load(PyArray_GETITEM(buf.ptr(), p),
+                                           convert))
+                            return false;
+                        value(i,j) = cast_op<Scalar>(conv_val);
+                    }
+                }
+            }
+        }
+        else
+        {
+            auto ref = reinterpret_steal<array>(eigen_ref_array<props>(value));
+            if (dims == 1) ref = ref.squeeze();
+            else if (ref.ndim() == 1) buf = buf.squeeze();
+            result =
+                detail::npy_api::get().PyArray_CopyInto_(ref.ptr(), buf.ptr());
+        }
 
         if (result < 0) { // Copy failed!
             PyErr_Clear();
@@ -423,6 +535,7 @@ private:
     // storage order conversion.  (Note that we refuse to use this temporary copy when loading an
     // argument for a Ref<M> with M non-const, i.e. a read-write reference).
     Array copy_or_ref;
+    typename std::remove_cv<PlainObjectType>::type val;
 public:
     bool load(handle src, bool convert) {
         // First check whether what we have is already an array of the right type.  If not, we can't
@@ -430,6 +543,14 @@ public:
         bool need_copy = !isinstance<Array>(src);
 
         EigenConformable<props::row_major> fits;
+        bool is_pyobject = false;
+        if (npy_format_descriptor<Scalar>::value == npy_api::NPY_OBJECT_) {
+            is_pyobject = true;
+            need_copy = true;
+        }
+        std::cout << "NEED COPY: " << need_copy << std::endl;
+        std::cout << "NEED WRITEABLE: " << need_writeable << std::endl;
+
         if (!need_copy) {
             // We don't need a converting copy, but we also need to check whether the strides are
             // compatible with the Ref's stride requirements
@@ -437,6 +558,8 @@ public:
 
             if (aref && (!need_writeable || aref.writeable())) {
                 fits = props::conformable(aref);
+                std::cout << "aref.writeable: " << aref.writeable() << std::endl;
+                std::cout << "fits: " << fits << std::endl;
                 if (!fits) return false; // Incompatible dimensions
                 if (!fits.template stride_compatible<props>())
                     need_copy = true;
@@ -452,20 +575,64 @@ public:
             // We need to copy: If we need a mutable reference, or we're not supposed to convert
             // (either because we're in the no-convert overload pass, or because we're explicitly
             // instructed not to copy (via `py::arg().noconvert()`) we have to fail loading.
-            if (!convert || need_writeable) return false;
+            if (!is_pyobject && (!convert || need_writeable)) {
+                std::cout << "FAIL 1" << std::endl;
+                return false;
+            }
 
             Array copy = Array::ensure(src);
             if (!copy) return false;
             fits = props::conformable(copy);
-            if (!fits || !fits.template stride_compatible<props>())
+            if (!fits || !fits.template stride_compatible<props>()) {
+                std::cout << "FAIL 2 " << fits <<  std::endl;
                 return false;
-            copy_or_ref = std::move(copy);
-            loader_life_support::add_patient(copy_or_ref);
+            }
+
+            if (npy_format_descriptor<Scalar>::value == npy_api::NPY_OBJECT_) {
+                auto dims = copy.ndim();
+                if (dims == 1){
+                    if (Type::RowsAtCompileTime == Eigen::Dynamic || Type::ColsAtCompileTime == Eigen::Dynamic) {
+                        val.resize(copy.shape(0), 1);
+                    }
+                    for (size_t i = 0; i < copy.shape(0); ++i) {
+                        auto p = copy.mutable_data(i);
+                        make_caster <Scalar> conv_val;
+                        if (!conv_val.load(PyArray_GETITEM(copy.ptr(), p),
+                                           convert))
+                            return false;
+                        val(i) = cast_op<Scalar>(conv_val);
+
+                    }
+                } else {
+                    if (Type::RowsAtCompileTime == Eigen::Dynamic || Type::ColsAtCompileTime == Eigen::Dynamic) {
+                        val.resize(copy.shape(0), copy.shape(1));
+                    }
+                    std::cout << "INSIDE NPY_OBJECT" << std::endl;
+                   for (size_t i = 0; i < copy.shape(0); ++i) {
+                       for (size_t j = 0; j < copy.shape(1); ++j) {
+                           // p is the const void pointer to the item
+                           auto p = copy.mutable_data(i, j);
+                           make_caster <Scalar> conv_val;
+                           if (!conv_val.load(PyArray_GETITEM(copy.ptr(), p),
+                                              convert))
+                               return false;
+                           val(i, j) = cast_op<Scalar>(conv_val);
+                       }
+                   }
+                }
+                ref.reset(new Type(val));
+                std::cout << "STRIDE INNER: " << fits.stride.inner() << "    OUTER:" << fits.stride.outer() << std::endl;
+                std::cout << "ROWS: " << fits.rows << "   COLS:" << fits.cols << std::endl;
+            }
+            else {
+                copy_or_ref = std::move(copy);
+                loader_life_support::add_patient(copy_or_ref);
+                ref.reset();
+                map.reset(new MapType(data(copy_or_ref), fits.rows, fits.cols, make_stride(fits.stride.outer(), fits.stride.inner())));
+                ref.reset(new Type(*map));
+            }
         }
 
-        ref.reset();
-        map.reset(new MapType(data(copy_or_ref), fits.rows, fits.cols, make_stride(fits.stride.outer(), fits.stride.inner())));
-        ref.reset(new Type(*map));
 
         return true;
     }
