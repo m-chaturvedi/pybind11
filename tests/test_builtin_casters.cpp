@@ -167,24 +167,18 @@ TEST_SUBMODULE(builtin_casters, m) {
         py::object o = py::cast(v);
         return py::cast<void *>(o) == v;
     });
-    class A {
-        public:
-        std::string s;
-        int i;
-        std::pair<std::string, int> P;
+
+    // For Drake issue: https://github.com/RobotLocomotion/drake/issues/9398
+    struct A {
+        int value{100};
+        static bool test_pointer_caster() {
+            A a{};
+            A *a_ptr = &a;
+            py::object o = py::cast(&a);  // Rvalue
+            py::object o1 = py::cast(a_ptr);  // Non-rvalue
+            return (py::cast<A*>(o) == a_ptr && py::cast<A*>(o1) == a_ptr);
+        }
     };
-
     py::class_<A>(m, "A")
-        .def(py::init());
-
-    m.def("test_pointer_caster", []() -> bool {
-        A a;
-        a.s = "String 1";
-        a.i = 100;
-        a.P = std::pair<std::string, int>("String 2", 10);
-        A *a_ptr = &a;
-        py::object o = py::cast(&a);
-        py::object o1 = py::cast(a_ptr);
-        return (py::cast<A*>(o) == a_ptr && py::cast<A*>(o1) == a_ptr);
-    });
+        .def_static("test_pointer_caster", &A::test_pointer_caster);
 }

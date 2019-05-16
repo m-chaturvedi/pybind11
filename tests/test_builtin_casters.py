@@ -343,4 +343,4 @@ def test_void_caster_2():
 
 
 def test_pointer_caster():
-    assert m.test_pointer_caster()
+    assert m.A.test_pointer_caster()
